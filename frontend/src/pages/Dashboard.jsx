@@ -54,12 +54,12 @@ export default function Dashboard() {
           <Card>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem' }}>
               <h2 style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>Recent applicants</h2>
-              <Link to="/jobs" style={{ fontSize: 12, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 4 }}>View jobs <ArrowRight size={12} /></Link>
+              <Link to="/my-jobs" style={{ fontSize: 12, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 4 }}>View jobs <ArrowRight size={12} /></Link>
             </div>
 
             {!data?.recentApplicants?.length ? (
               <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text3)', fontSize: 13 }}>
-                No applicants yet. <Link to="/jobs" style={{ color: 'var(--accent)' }}>Create a job posting →</Link>
+                No applicants yet. <Link to="/my-jobs" style={{ color: 'var(--accent)' }}>Create a job posting →</Link>
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>

@@ -327,7 +327,7 @@ export default function JobDetail() {
       <div style={{ flex: 1, overflow: 'auto', padding: '2rem' }}>
         {/* Breadcrumb */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: '1.5rem', fontSize: 13, color: 'var(--text2)' }}>
-          <Link to="/jobs" style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text2)', textDecoration: 'none' }}><ChevronLeft size={14} /> Jobs</Link>
+          <Link to="/my-jobs" style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text2)', textDecoration: 'none' }}><ChevronLeft size={14} /> Jobs</Link>
           <span>/</span>
           <span style={{ color: 'var(--text)', fontWeight: 500 }}>{job.title}</span>
         </div>

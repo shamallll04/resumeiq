@@ -10,11 +10,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, 'resumeiq.db');
 
 let _db = null;
-let SQL = null;
 
 export async function getDb() {
   if (_db) return _db;
-  SQL = await initSqlJs();
+  const SQL = await initSqlJs();
   if (existsSync(DB_PATH)) {
     const buf = readFileSync(DB_PATH);
     _db = new SQL.Database(buf);
@@ -22,14 +21,13 @@ export async function getDb() {
     _db = new SQL.Database();
   }
 
-  _db.run(`PRAGMA foreign_keys = ON;`);
-
   _db.run(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       email TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       company_name TEXT NOT NULL,
+      plan TEXT DEFAULT 'free',
       created_at TEXT DEFAULT (datetime('now'))
     );
     CREATE TABLE IF NOT EXISTS job_postings (
@@ -39,6 +37,7 @@ export async function getDb() {
       department TEXT DEFAULT '',
       description TEXT DEFAULT '',
       min_score INTEGER DEFAULT 70,
+      is_public INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -66,6 +65,10 @@ export async function getDb() {
     );
   `);
 
+  // migrations for databases created before plan / is_public existed
+  try { _db.run("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'"); } catch {}
+  try { _db.run("ALTER TABLE job_postings ADD COLUMN is_public INTEGER DEFAULT 0"); } catch {}
+
   save();
   return _db;
 }
@@ -76,7 +79,6 @@ export function save() {
   writeFileSync(DB_PATH, Buffer.from(data));
 }
 
-// Helper: run a query and return all rows as objects
 export function all(db, sql, params = []) {
   try {
     const stmt = db.prepare(sql);
@@ -88,13 +90,10 @@ export function all(db, sql, params = []) {
   } catch { return []; }
 }
 
-// Helper: return first row
 export function get(db, sql, params = []) {
-  const rows = all(db, sql, params);
-  return rows[0] || null;
+  return all(db, sql, params)[0] || null;
 }
 
-// Helper: run insert/update/delete
 export function run(db, sql, params = []) {
   db.run(sql, params);
   save();

@@ -1,28 +1,30 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
 import { v4 as uuid } from 'uuid';
+import Groq from 'groq-sdk';
 import { getDb, all, get, run } from './db.js';
 import { signToken, auth } from './auth.js';
 
-// pdf-parse ESM compat
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin123';
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-async function askOllama(prompt) {
-  const res = await fetch(`${OLLAMA_URL}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: OLLAMA_MODEL, prompt, stream: false }),
+async function askAI(prompt) {
+  const completion = await groq.chat.completions.create({
+    model: 'openai/gpt-oss-20b',
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.1,
+    max_tokens: 1500,
   });
-  if (!res.ok) throw new Error(`Ollama error: ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  return data.response;
+  return completion.choices[0].message.content;
 }
 
 const app = express();
@@ -42,10 +44,10 @@ app.post('/api/auth/register', async (req, res) => {
   if (existing) return res.status(409).json({ error: 'Email already registered' });
   const password_hash = await bcrypt.hash(password, 10);
   const id = uuid();
-  run(db, 'INSERT INTO users (id,email,password_hash,company_name) VALUES (?,?,?,?)',
-    [id, email.toLowerCase(), password_hash, company_name]);
+  run(db, 'INSERT INTO users (id,email,password_hash,company_name,plan) VALUES (?,?,?,?,?)',
+    [id, email.toLowerCase(), password_hash, company_name, 'free']);
   const token = signToken({ id, email, company_name });
-  res.json({ token, user: { id, email, company_name } });
+  res.json({ token, user: { id, email, company_name, plan: 'free' } });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -55,12 +57,12 @@ app.post('/api/auth/login', async (req, res) => {
   if (!user || !(await bcrypt.compare(password, user.password_hash)))
     return res.status(401).json({ error: 'Invalid email or password' });
   const token = signToken({ id: user.id, email: user.email, company_name: user.company_name });
-  res.json({ token, user: { id: user.id, email: user.email, company_name: user.company_name } });
+  res.json({ token, user: { id: user.id, email: user.email, company_name: user.company_name, plan: user.plan } });
 });
 
 app.get('/api/auth/me', auth, async (req, res) => {
   const db = await getDb();
-  const user = get(db, 'SELECT id,email,company_name,created_at FROM users WHERE id=?', [req.user.id]);
+  const user = get(db, 'SELECT id,email,company_name,plan,created_at FROM users WHERE id=?', [req.user.id]);
   res.json(user);
 });
 
@@ -78,11 +80,11 @@ app.get('/api/jobs', auth, async (req, res) => {
 
 app.post('/api/jobs', auth, async (req, res) => {
   const db = await getDb();
-  const { title, department, description, min_score } = req.body;
+  const { title, department, description, min_score, is_public } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required' });
   const id = uuid();
-  run(db, 'INSERT INTO job_postings (id,user_id,title,department,description,min_score) VALUES (?,?,?,?,?,?)',
-    [id, req.user.id, title, department || '', description || '', min_score || 70]);
+  run(db, 'INSERT INTO job_postings (id,user_id,title,department,description,min_score,is_public) VALUES (?,?,?,?,?,?,?)',
+    [id, req.user.id, title, department || '', description || '', min_score || 70, is_public ? 1 : 0]);
   res.json(get(db, 'SELECT * FROM job_postings WHERE id=?', [id]));
 });
 
@@ -90,9 +92,9 @@ app.put('/api/jobs/:id', auth, async (req, res) => {
   const db = await getDb();
   const job = get(db, 'SELECT * FROM job_postings WHERE id=? AND user_id=?', [req.params.id, req.user.id]);
   if (!job) return res.status(404).json({ error: 'Not found' });
-  const { title, department, description, min_score } = req.body;
-  run(db, 'UPDATE job_postings SET title=?,department=?,description=?,min_score=? WHERE id=?',
-    [title||job.title, department??job.department, description??job.description, min_score??job.min_score, job.id]);
+  const { title, department, description, min_score, is_public } = req.body;
+  run(db, 'UPDATE job_postings SET title=?,department=?,description=?,min_score=?,is_public=? WHERE id=?',
+    [title||job.title, department??job.department, description??job.description, min_score??job.min_score, is_public !== undefined ? (is_public ? 1 : 0) : job.is_public, job.id]);
   res.json(get(db, 'SELECT * FROM job_postings WHERE id=?', [job.id]));
 });
 
@@ -102,6 +104,87 @@ app.delete('/api/jobs/:id', auth, async (req, res) => {
   run(db, 'DELETE FROM criteria WHERE job_id=?', [req.params.id]);
   run(db, 'DELETE FROM job_postings WHERE id=? AND user_id=?', [req.params.id, req.user.id]);
   res.json({ ok: true });
+});
+
+// ─── PUBLIC JOB BOARD ─────────────────────────────────────────────────────────
+
+app.get('/api/public/jobs', async (req, res) => {
+  const db = await getDb();
+  const jobs = all(db, `SELECT j.id, j.title, j.department, j.description, j.created_at, u.company_name
+    FROM job_postings j JOIN users u ON u.id=j.user_id
+    WHERE j.is_public=1 ORDER BY j.created_at DESC`);
+  res.json(jobs);
+});
+
+app.get('/api/public/jobs/:id', async (req, res) => {
+  const db = await getDb();
+  const job = get(db, `SELECT j.*, u.company_name FROM job_postings j
+    JOIN users u ON u.id=j.user_id WHERE j.id=? AND j.is_public=1`, [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  const criteria = all(db, 'SELECT * FROM criteria WHERE job_id=? ORDER BY sort_order', [req.params.id]);
+  res.json({ ...job, criteria });
+});
+
+// Public CV submission
+app.post('/api/public/jobs/:id/apply', upload.single('cv'), async (req, res) => {
+  const db = await getDb();
+  const job = get(db, `SELECT j.*, u.company_name FROM job_postings j
+    JOIN users u ON u.id=j.user_id WHERE j.id=? AND j.is_public=1`, [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  let cvText = '';
+  const file = req.file;
+  if (file) {
+    if (file.mimetype === 'application/pdf') {
+      try { const p = await pdfParse(file.buffer); cvText = p.text; }
+      catch { return res.status(400).json({ error: 'Could not parse PDF' }); }
+    } else { cvText = file.buffer.toString('utf-8'); }
+  } else if (req.body.cv_text) {
+    cvText = req.body.cv_text;
+  } else {
+    return res.status(400).json({ error: 'No CV provided' });
+  }
+
+  const name = req.body.name || 'Unknown';
+  const email = req.body.email || '';
+  const criteriaList = all(db, 'SELECT * FROM criteria WHERE job_id=? ORDER BY sort_order', [job.id]);
+  if (!criteriaList.length) return res.status(400).json({ error: 'No criteria set for this job' });
+
+  const criteriaText = criteriaList.map((c, i) => `${i+1}. [${c.type.toUpperCase()}][${c.category}] ${c.text}`).join('\n');
+  const prompt = `You are an expert HR analyst. Evaluate this CV for the role of "${job.title}" at ${job.company_name}.
+
+HIRING CRITERIA:
+${criteriaText}
+
+CV TEXT:
+${cvText}
+
+Respond ONLY with valid JSON, no markdown:
+{
+  "score": <integer 0-100>,
+  "tier": "<strong or partial or weak>",
+  "criteria_results": [{ "index": 1, "status": "<pass or partial or fail>", "reason": "<one sentence>" }],
+  "strengths": ["strength 1", "strength 2"],
+  "gaps": ["gap 1", "gap 2"],
+  "summary": "<2-3 sentence hiring verdict>"
+}`;
+
+  let analysis;
+  try {
+    const raw = await askAI(prompt);
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('No JSON in response');
+    analysis = JSON.parse(match[0]);
+  } catch (e) {
+    return res.status(500).json({ error: 'AI analysis failed: ' + e.message });
+  }
+
+  const id = uuid();
+  run(db, `INSERT INTO applicants (id,job_id,name,email,cv_text,cv_filename,score,tier,analysis_json,status)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [id, job.id, name, email, cvText, file?.originalname||null, analysis.score, analysis.tier, JSON.stringify(analysis), 'pending']);
+
+  res.json({ id, score: analysis.score, tier: analysis.tier, summary: analysis.summary });
 });
 
 // ─── CRITERIA ─────────────────────────────────────────────────────────────────
@@ -149,8 +232,7 @@ app.get('/api/jobs/:jobId/applicants', auth, async (req, res) => {
 app.get('/api/applicants/:id', auth, async (req, res) => {
   const db = await getDb();
   const a = get(db, `SELECT a.* FROM applicants a
-    JOIN job_postings j ON j.id=a.job_id
-    WHERE a.id=? AND j.user_id=?`, [req.params.id, req.user.id]);
+    JOIN job_postings j ON j.id=a.job_id WHERE a.id=? AND j.user_id=?`, [req.params.id, req.user.id]);
   if (!a) return res.status(404).json({ error: 'Not found' });
   if (a.analysis_json) a.analysis = JSON.parse(a.analysis_json);
   res.json(a);
@@ -161,7 +243,7 @@ app.patch('/api/applicants/:id/status', auth, async (req, res) => {
   const { status } = req.body;
   if (!['pending','reviewed','shortlisted','rejected'].includes(status))
     return res.status(400).json({ error: 'Invalid status' });
-  run(db, `UPDATE applicants SET status=? WHERE id=?`, [status, req.params.id]);
+  run(db, 'UPDATE applicants SET status=? WHERE id=?', [status, req.params.id]);
   res.json({ ok: true });
 });
 
@@ -171,7 +253,7 @@ app.delete('/api/applicants/:id', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── CV UPLOAD + AI ANALYSIS ──────────────────────────────────────────────────
+// ─── CV UPLOAD (company side) ─────────────────────────────────────────────────
 
 app.post('/api/jobs/:jobId/upload', auth, upload.single('cv'), async (req, res) => {
   const db = await getDb();
@@ -184,9 +266,7 @@ app.post('/api/jobs/:jobId/upload', auth, upload.single('cv'), async (req, res) 
     if (file.mimetype === 'application/pdf') {
       try { const p = await pdfParse(file.buffer); cvText = p.text; }
       catch { return res.status(400).json({ error: 'Could not parse PDF' }); }
-    } else {
-      cvText = file.buffer.toString('utf-8');
-    }
+    } else { cvText = file.buffer.toString('utf-8'); }
   } else if (req.body.cv_text) {
     cvText = req.body.cv_text;
   } else {
@@ -198,10 +278,7 @@ app.post('/api/jobs/:jobId/upload', auth, upload.single('cv'), async (req, res) 
   const criteriaList = all(db, 'SELECT * FROM criteria WHERE job_id=? ORDER BY sort_order', [job.id]);
   if (!criteriaList.length) return res.status(400).json({ error: 'Add criteria to this job first' });
 
-  const criteriaText = criteriaList.map((c, i) =>
-    `${i + 1}. [${c.type.toUpperCase()}][${c.category}] ${c.text}`
-  ).join('\n');
-
+  const criteriaText = criteriaList.map((c, i) => `${i+1}. [${c.type.toUpperCase()}][${c.category}] ${c.text}`).join('\n');
   const prompt = `You are an expert HR analyst. Evaluate this CV for the role of "${job.title}".
 
 HIRING CRITERIA:
@@ -210,21 +287,19 @@ ${criteriaText}
 CV TEXT:
 ${cvText}
 
-Respond ONLY with a valid JSON object, no markdown, no explanation, just JSON:
+Respond ONLY with valid JSON, no markdown:
 {
   "score": <integer 0-100>,
   "tier": "<strong or partial or weak>",
-  "criteria_results": [
-    { "index": 1, "status": "<pass or partial or fail>", "reason": "<one sentence>" }
-  ],
+  "criteria_results": [{ "index": 1, "status": "<pass or partial or fail>", "reason": "<one sentence>" }],
   "strengths": ["strength 1", "strength 2"],
   "gaps": ["gap 1", "gap 2"],
-  "summary": "<2-3 sentence hiring manager verdict>"
+  "summary": "<2-3 sentence hiring verdict>"
 }`;
 
   let analysis;
   try {
-    const raw = await askOllama(prompt);
+    const raw = await askAI(prompt);
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) throw new Error('No JSON in response');
     analysis = JSON.parse(match[0]);
@@ -240,26 +315,93 @@ Respond ONLY with a valid JSON object, no markdown, no explanation, just JSON:
   res.json({ id, score: analysis.score, tier: analysis.tier, analysis });
 });
 
+// ─── PAYMENTS (Razorpay stub — replace with real keys) ────────────────────────
+
+app.post('/api/payments/create-order', auth, async (req, res) => {
+  const { plan } = req.body;
+  const prices = { pro: 99900, enterprise: 299900 }; // paise
+  const amount = prices[plan];
+  if (!amount) return res.status(400).json({ error: 'Invalid plan' });
+
+  // Stub response — replace with real Razorpay order creation
+  const orderId = 'order_' + uuid().replace(/-/g, '').slice(0, 16);
+  res.json({ orderId, amount, currency: 'INR', plan });
+});
+
+app.post('/api/payments/verify', auth, async (req, res) => {
+  const db = await getDb();
+  const { plan } = req.body;
+  // In production: verify Razorpay signature here
+  run(db, 'UPDATE users SET plan=? WHERE id=?', [plan, req.user.id]);
+  res.json({ ok: true, plan });
+});
+
+// ─── ADMIN ────────────────────────────────────────────────────────────────────
+
+function adminAuth(req, res, next) {
+  const secret = req.headers['x-admin-secret'];
+  if (secret !== ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  next();
+}
+
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
+  const db = await getDb();
+  const total_companies = all(db, 'SELECT COUNT(*) as n FROM users').map(r => r.n)[0] || 0;
+  const total_jobs = all(db, 'SELECT COUNT(*) as n FROM job_postings').map(r => r.n)[0] || 0;
+  const total_applicants = all(db, 'SELECT COUNT(*) as n FROM applicants').map(r => r.n)[0] || 0;
+  const pro_users = all(db, "SELECT COUNT(*) as n FROM users WHERE plan='pro'").map(r => r.n)[0] || 0;
+  res.json({ total_companies, total_jobs, total_applicants, pro_users });
+});
+
+app.get('/api/admin/companies', adminAuth, async (req, res) => {
+  const db = await getDb();
+  const companies = all(db, `SELECT u.id, u.email, u.company_name, u.plan, u.created_at,
+    (SELECT COUNT(*) FROM job_postings WHERE user_id=u.id) as jobs,
+    (SELECT COUNT(*) FROM applicants a JOIN job_postings j ON j.id=a.job_id WHERE j.user_id=u.id) as applicants
+    FROM users u ORDER BY u.created_at DESC`);
+  res.json(companies);
+});
+
+app.patch('/api/admin/companies/:id/plan', adminAuth, async (req, res) => {
+  const db = await getDb();
+  const { plan } = req.body;
+  run(db, 'UPDATE users SET plan=? WHERE id=?', [plan, req.params.id]);
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/companies/:id', adminAuth, async (req, res) => {
+  const db = await getDb();
+  const jobs = all(db, 'SELECT id FROM job_postings WHERE user_id=?', [req.params.id]);
+  for (const j of jobs) {
+    run(db, 'DELETE FROM applicants WHERE job_id=?', [j.id]);
+    run(db, 'DELETE FROM criteria WHERE job_id=?', [j.id]);
+  }
+  run(db, 'DELETE FROM job_postings WHERE user_id=?', [req.params.id]);
+  run(db, 'DELETE FROM users WHERE id=?', [req.params.id]);
+  res.json({ ok: true });
+});
+
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
 app.get('/api/dashboard', auth, async (req, res) => {
   const db = await getDb();
   const jobs = all(db, 'SELECT id FROM job_postings WHERE user_id=?', [req.user.id]);
   const jobIds = jobs.map(j => `'${j.id}'`).join(',') || "''";
-
-  const total_jobs = jobs.length;
   const applicants = all(db, `SELECT * FROM applicants WHERE job_id IN (${jobIds})`);
-  const total_applicants = applicants.length;
-  const strong_matches = applicants.filter(a => a.tier === 'strong').length;
-  const shortlisted = applicants.filter(a => a.status === 'shortlisted').length;
   const scores = applicants.filter(a => a.score).map(a => Number(a.score));
-  const avg_score = scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : null;
-
   const recentApplicants = all(db, `SELECT a.id,a.name,a.score,a.tier,a.status,a.created_at,j.title as job_title
     FROM applicants a JOIN job_postings j ON j.id=a.job_id
     WHERE j.user_id=? ORDER BY a.created_at DESC LIMIT 8`, [req.user.id]);
-
-  res.json({ stats: { total_jobs, total_applicants, strong_matches, shortlisted, avg_score }, recentApplicants });
+  res.json({
+    stats: {
+      total_jobs: jobs.length,
+      total_applicants: applicants.length,
+      strong_matches: applicants.filter(a => a.tier === 'strong').length,
+      shortlisted: applicants.filter(a => a.status === 'shortlisted').length,
+      avg_score: scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : null,
+    },
+    recentApplicants,
+  });
 });
 
 const PORT = process.env.PORT || 3001;
