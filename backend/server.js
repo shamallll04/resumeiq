@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import express from 'express';
+import crypto from 'crypto';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
@@ -27,7 +28,73 @@ async function askAI(prompt) {
   return completion.choices[0].message.content;
 }
 
+// ─── PLANS & LIMITS ───────────────────────────────────────────────────────────
+const PLAN_LIMITS = {
+  free:       { jobs: 3,        cvsPerMonth: 50,       publicBoard: false },
+  pro:        { jobs: Infinity, cvsPerMonth: 500,      publicBoard: true  },
+  enterprise: { jobs: Infinity, cvsPerMonth: Infinity, publicBoard: true  },
+};
+const PLAN_PRICES = { pro: 99900, enterprise: 299900 }; // paise (INR)
+const PLAN_DAYS = 30;
+const RZP_KEY_ID = process.env.RAZORPAY_KEY_ID;
+const RZP_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+
+// A paid plan that has expired counts as free
+function effectivePlan(user) {
+  if (!user) return 'free';
+  const plan = PLAN_LIMITS[user.plan] ? user.plan : 'free';
+  if (plan !== 'free' && user.plan_expires_at && new Date(user.plan_expires_at) < new Date()) return 'free';
+  return plan;
+}
+
+function planOf(db, userId) {
+  return effectivePlan(get(db, 'SELECT plan, plan_expires_at FROM users WHERE id=?', [userId]));
+}
+
+const monthKey = () => new Date().toISOString().slice(0, 7);
+
+function getUsage(db, userId) {
+  const row = get(db, 'SELECT cvs FROM usage WHERE user_id=? AND month=?', [userId, monthKey()]);
+  return row ? Number(row.cvs) : 0;
+}
+
+// Usage is a counter, not a row count, so deleting applicants can't reset the quota
+function addUsage(db, userId) {
+  run(db, `INSERT INTO usage (user_id, month, cvs) VALUES (?,?,1)
+           ON CONFLICT(user_id, month) DO UPDATE SET cvs = cvs + 1`, [userId, monthKey()]);
+}
+
+function limitError(res, message) {
+  return res.status(403).json({ error: message, code: 'PLAN_LIMIT' });
+}
+
+// Returns an error message if the owner can't analyze another CV this month
+function cvQuotaError(db, userId) {
+  const plan = planOf(db, userId);
+  const max = PLAN_LIMITS[plan].cvsPerMonth;
+  if (getUsage(db, userId) >= max)
+    return `Monthly limit of ${max} CVs reached on the ${plan} plan. Upgrade to analyze more.`;
+  return null;
+}
+
+// SQL fragment: job owner currently has a paid, non-expired plan
+const PAID_OWNER = "u.plan IN ('pro','enterprise') AND (u.plan_expires_at IS NULL OR u.plan_expires_at > ?)";
+
+// Public apply is unauthenticated and each call costs an AI request: cap per IP
+const applyHits = new Map();
+setInterval(() => applyHits.clear(), 60 * 60 * 1000).unref();
+function applyRateLimit(req, res, next) {
+  const now = Date.now();
+  const hits = (applyHits.get(req.ip) || []).filter(t => now - t < 60 * 60 * 1000);
+  if (hits.length >= 5)
+    return res.status(429).json({ error: 'Too many applications from this connection. Try again later.' });
+  hits.push(now);
+  applyHits.set(req.ip, hits);
+  next();
+}
+
 const app = express();
+app.set('trust proxy', 1);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.use(cors());
@@ -57,12 +124,13 @@ app.post('/api/auth/login', async (req, res) => {
   if (!user || !(await bcrypt.compare(password, user.password_hash)))
     return res.status(401).json({ error: 'Invalid email or password' });
   const token = signToken({ id: user.id, email: user.email, company_name: user.company_name });
-  res.json({ token, user: { id: user.id, email: user.email, company_name: user.company_name, plan: user.plan } });
+  res.json({ token, user: { id: user.id, email: user.email, company_name: user.company_name, plan: effectivePlan(user) } });
 });
 
 app.get('/api/auth/me', auth, async (req, res) => {
   const db = await getDb();
-  const user = get(db, 'SELECT id,email,company_name,plan,created_at FROM users WHERE id=?', [req.user.id]);
+  const user = get(db, 'SELECT id,email,company_name,plan,plan_expires_at,created_at FROM users WHERE id=?', [req.user.id]);
+  if (user) user.plan = effectivePlan(user);
   res.json(user);
 });
 
@@ -82,6 +150,13 @@ app.post('/api/jobs', auth, async (req, res) => {
   const db = await getDb();
   const { title, department, description, min_score, is_public } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required' });
+  const plan = planOf(db, req.user.id);
+  const lim = PLAN_LIMITS[plan];
+  const count = Number(get(db, 'SELECT COUNT(*) as n FROM job_postings WHERE user_id=?', [req.user.id]).n);
+  if (count >= lim.jobs)
+    return limitError(res, `The ${plan} plan allows ${lim.jobs} job postings. Upgrade to add more.`);
+  if (is_public && !lim.publicBoard)
+    return limitError(res, 'The public job board is available on Pro and Enterprise plans.');
   const id = uuid();
   run(db, 'INSERT INTO job_postings (id,user_id,title,department,description,min_score,is_public) VALUES (?,?,?,?,?,?,?)',
     [id, req.user.id, title, department || '', description || '', min_score || 70, is_public ? 1 : 0]);
@@ -93,6 +168,8 @@ app.put('/api/jobs/:id', auth, async (req, res) => {
   const job = get(db, 'SELECT * FROM job_postings WHERE id=? AND user_id=?', [req.params.id, req.user.id]);
   if (!job) return res.status(404).json({ error: 'Not found' });
   const { title, department, description, min_score, is_public } = req.body;
+  if (is_public && !PLAN_LIMITS[planOf(db, req.user.id)].publicBoard)
+    return limitError(res, 'The public job board is available on Pro and Enterprise plans.');
   run(db, 'UPDATE job_postings SET title=?,department=?,description=?,min_score=?,is_public=? WHERE id=?',
     [title||job.title, department??job.department, description??job.description, min_score??job.min_score, is_public !== undefined ? (is_public ? 1 : 0) : job.is_public, job.id]);
   res.json(get(db, 'SELECT * FROM job_postings WHERE id=?', [job.id]));
@@ -112,24 +189,24 @@ app.get('/api/public/jobs', async (req, res) => {
   const db = await getDb();
   const jobs = all(db, `SELECT j.id, j.title, j.department, j.description, j.created_at, u.company_name
     FROM job_postings j JOIN users u ON u.id=j.user_id
-    WHERE j.is_public=1 ORDER BY j.created_at DESC`);
+    WHERE j.is_public=1 AND ${PAID_OWNER} ORDER BY j.created_at DESC`, [new Date().toISOString()]);
   res.json(jobs);
 });
 
 app.get('/api/public/jobs/:id', async (req, res) => {
   const db = await getDb();
   const job = get(db, `SELECT j.*, u.company_name FROM job_postings j
-    JOIN users u ON u.id=j.user_id WHERE j.id=? AND j.is_public=1`, [req.params.id]);
+    JOIN users u ON u.id=j.user_id WHERE j.id=? AND j.is_public=1 AND ${PAID_OWNER}`, [req.params.id, new Date().toISOString()]);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   const criteria = all(db, 'SELECT * FROM criteria WHERE job_id=? ORDER BY sort_order', [req.params.id]);
   res.json({ ...job, criteria });
 });
 
 // Public CV submission
-app.post('/api/public/jobs/:id/apply', upload.single('cv'), async (req, res) => {
+app.post('/api/public/jobs/:id/apply', applyRateLimit, upload.single('cv'), async (req, res) => {
   const db = await getDb();
   const job = get(db, `SELECT j.*, u.company_name FROM job_postings j
-    JOIN users u ON u.id=j.user_id WHERE j.id=? AND j.is_public=1`, [req.params.id]);
+    JOIN users u ON u.id=j.user_id WHERE j.id=? AND j.is_public=1 AND ${PAID_OWNER}`, [req.params.id, new Date().toISOString()]);
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
   let cvText = '';
@@ -149,6 +226,8 @@ app.post('/api/public/jobs/:id/apply', upload.single('cv'), async (req, res) => 
   const email = req.body.email || '';
   const criteriaList = all(db, 'SELECT * FROM criteria WHERE job_id=? ORDER BY sort_order', [job.id]);
   if (!criteriaList.length) return res.status(400).json({ error: 'No criteria set for this job' });
+  if (cvQuotaError(db, job.user_id))
+    return res.status(403).json({ error: 'This employer is not accepting new applications right now.' });
 
   const criteriaText = criteriaList.map((c, i) => `${i+1}. [${c.type.toUpperCase()}][${c.category}] ${c.text}`).join('\n');
   const prompt = `You are an expert HR analyst. Evaluate this CV for the role of "${job.title}" at ${job.company_name}.
@@ -183,6 +262,7 @@ Respond ONLY with valid JSON, no markdown:
   run(db, `INSERT INTO applicants (id,job_id,name,email,cv_text,cv_filename,score,tier,analysis_json,status)
     VALUES (?,?,?,?,?,?,?,?,?,?)`,
     [id, job.id, name, email, cvText, file?.originalname||null, analysis.score, analysis.tier, JSON.stringify(analysis), 'pending']);
+  addUsage(db, job.user_id);
 
   res.json({ id, score: analysis.score, tier: analysis.tier, summary: analysis.summary });
 });
@@ -277,6 +357,8 @@ app.post('/api/jobs/:jobId/upload', auth, upload.single('cv'), async (req, res) 
   const email = req.body.email || '';
   const criteriaList = all(db, 'SELECT * FROM criteria WHERE job_id=? ORDER BY sort_order', [job.id]);
   if (!criteriaList.length) return res.status(400).json({ error: 'Add criteria to this job first' });
+  const quotaMsg = cvQuotaError(db, job.user_id);
+  if (quotaMsg) return limitError(res, quotaMsg);
 
   const criteriaText = criteriaList.map((c, i) => `${i+1}. [${c.type.toUpperCase()}][${c.category}] ${c.text}`).join('\n');
   const prompt = `You are an expert HR analyst. Evaluate this CV for the role of "${job.title}".
@@ -311,29 +393,87 @@ Respond ONLY with valid JSON, no markdown:
   run(db, `INSERT INTO applicants (id,job_id,name,email,cv_text,cv_filename,score,tier,analysis_json,status)
     VALUES (?,?,?,?,?,?,?,?,?,?)`,
     [id, job.id, name, email, cvText, file?.originalname||null, analysis.score, analysis.tier, JSON.stringify(analysis), 'pending']);
+  addUsage(db, job.user_id);
 
   res.json({ id, score: analysis.score, tier: analysis.tier, analysis });
 });
 
-// ─── PAYMENTS (Razorpay stub — replace with real keys) ────────────────────────
+// ─── PAYMENTS (Razorpay) ──────────────────────────────────────────────────────
 
 app.post('/api/payments/create-order', auth, async (req, res) => {
-  const { plan } = req.body;
-  const prices = { pro: 99900, enterprise: 299900 }; // paise
-  const amount = prices[plan];
-  if (!amount) return res.status(400).json({ error: 'Invalid plan' });
+  try {
+    if (!RZP_KEY_ID || !RZP_KEY_SECRET)
+      return res.status(503).json({ error: 'Online payments are not set up yet. Contact support to upgrade.' });
+    const db = await getDb();
+    const { plan } = req.body;
+    const amount = PLAN_PRICES[plan];
+    if (!amount) return res.status(400).json({ error: 'Invalid plan' });
 
-  // Stub response — replace with real Razorpay order creation
-  const orderId = 'order_' + uuid().replace(/-/g, '').slice(0, 16);
-  res.json({ orderId, amount, currency: 'INR', plan });
+    const rzp = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Basic ' + Buffer.from(`${RZP_KEY_ID}:${RZP_KEY_SECRET}`).toString('base64'),
+      },
+      body: JSON.stringify({ amount, currency: 'INR', receipt: uuid().slice(0, 30), notes: { user_id: req.user.id, plan } }),
+    });
+    const order = await rzp.json();
+    if (!rzp.ok) return res.status(502).json({ error: order?.error?.description || 'Could not create payment order' });
+
+    run(db, 'INSERT INTO orders (id,user_id,plan,amount,status) VALUES (?,?,?,?,?)',
+      [order.id, req.user.id, plan, amount, 'created']);
+    res.json({ orderId: order.id, amount, currency: 'INR', plan, keyId: RZP_KEY_ID });
+  } catch (e) {
+    res.status(502).json({ error: 'Payment service unavailable: ' + e.message });
+  }
 });
 
 app.post('/api/payments/verify', auth, async (req, res) => {
+  try {
+    if (!RZP_KEY_SECRET) return res.status(503).json({ error: 'Online payments are not set up yet.' });
+    const db = await getDb();
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature)
+      return res.status(400).json({ error: 'Missing payment details' });
+
+    const order = get(db, 'SELECT * FROM orders WHERE id=? AND user_id=?', [razorpay_order_id, req.user.id]);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status === 'paid') return res.json({ ok: true, plan: order.plan }); // idempotent
+
+    const expected = crypto.createHmac('sha256', RZP_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+    const a = Buffer.from(expected);
+    const b = Buffer.from(String(razorpay_signature));
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b))
+      return res.status(400).json({ error: 'Payment verification failed' });
+
+    // Renewing the same plan extends from its current expiry instead of losing days
+    const user = get(db, 'SELECT plan, plan_expires_at FROM users WHERE id=?', [req.user.id]);
+    const stillActive = effectivePlan(user) === order.plan && user.plan_expires_at;
+    const base = stillActive ? new Date(user.plan_expires_at) : new Date();
+    const expires = new Date(base.getTime() + PLAN_DAYS * 86400000).toISOString();
+
+    run(db, 'UPDATE users SET plan=?, plan_expires_at=? WHERE id=?', [order.plan, expires, req.user.id]);
+    run(db, "UPDATE orders SET status='paid', payment_id=? WHERE id=?", [razorpay_payment_id, order.id]);
+    res.json({ ok: true, plan: order.plan, expires });
+  } catch (e) {
+    res.status(500).json({ error: 'Verification error: ' + e.message });
+  }
+});
+
+// Current plan, limits and usage (for the UI)
+app.get('/api/usage', auth, async (req, res) => {
   const db = await getDb();
-  const { plan } = req.body;
-  // In production: verify Razorpay signature here
-  run(db, 'UPDATE users SET plan=? WHERE id=?', [plan, req.user.id]);
-  res.json({ ok: true, plan });
+  const user = get(db, 'SELECT plan, plan_expires_at FROM users WHERE id=?', [req.user.id]);
+  const plan = effectivePlan(user);
+  const lim = PLAN_LIMITS[plan];
+  const cap = n => (Number.isFinite(n) ? n : null); // null = unlimited
+  const jobs = Number(get(db, 'SELECT COUNT(*) as n FROM job_postings WHERE user_id=?', [req.user.id]).n);
+  res.json({
+    plan, expires: user?.plan_expires_at || null, publicBoard: lim.publicBoard,
+    jobs: { used: jobs, limit: cap(lim.jobs) },
+    cvs: { used: getUsage(db, req.user.id), limit: cap(lim.cvsPerMonth) },
+  });
 });
 
 // ─── ADMIN ────────────────────────────────────────────────────────────────────
@@ -365,7 +505,8 @@ app.get('/api/admin/companies', adminAuth, async (req, res) => {
 app.patch('/api/admin/companies/:id/plan', adminAuth, async (req, res) => {
   const db = await getDb();
   const { plan } = req.body;
-  run(db, 'UPDATE users SET plan=? WHERE id=?', [plan, req.params.id]);
+  if (!PLAN_LIMITS[plan]) return res.status(400).json({ error: 'Invalid plan' });
+  run(db, 'UPDATE users SET plan=?, plan_expires_at=NULL WHERE id=?', [plan, req.params.id]);
   res.json({ ok: true });
 });
 

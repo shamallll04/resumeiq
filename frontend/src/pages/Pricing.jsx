@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { CheckCircle, ArrowLeft } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
@@ -24,33 +24,81 @@ const plans = [
   },
 ];
 
+function loadRazorpay() {
+  return new Promise((resolve, reject) => {
+    if (window.Razorpay) return resolve();
+    const el = document.createElement('script');
+    el.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    el.onload = resolve;
+    el.onerror = () => reject(new Error('Could not load the payment window'));
+    document.body.appendChild(el);
+  });
+}
+
+function UsageBar({ label, used, limit }) {
+  const unlimited = limit === null;
+  const pct = unlimited ? 0 : Math.min(100, Math.round((used / limit) * 100));
+  const color = pct >= 100 ? '#dc2626' : pct >= 80 ? '#d97706' : '#5b51f8';
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#6b6895', marginBottom: 5 }}>
+        <span>{label}</span>
+        <span style={{ fontWeight: 600, color: '#1a1830' }}>{used} / {unlimited ? 'Unlimited' : limit}</span>
+      </div>
+      <div style={{ height: 6, background: '#f1f0fe', borderRadius: 3, overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: unlimited ? '8%' : `${pct}%`, background: unlimited ? '#16a34a' : color, borderRadius: 3 }} />
+      </div>
+    </div>
+  );
+}
+
 export default function Pricing() {
   const { user } = useAuth();
   const [loading, setLoading] = useState('');
+
+  const [usage, setUsage] = useState(null);
+  const authHeaders = () => ({
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${localStorage.getItem('riq_token')}`,
+  });
+
+  useEffect(() => {
+    fetch(`${BASE}/usage`, { headers: authHeaders() })
+      .then(r => r.json()).then(d => { if (!d.error) setUsage(d); }).catch(() => {});
+  }, []);
 
   const upgrade = async (plan) => {
     if (plan === 'free') return;
     setLoading(plan);
     try {
-      const token = localStorage.getItem('riq_token');
-      const res = await fetch(`${BASE}/payments/create-order`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ plan }),
-      });
+      const res = await fetch(`${BASE}/payments/create-order`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ plan }) });
       const order = await res.json();
-
-      // In production: open Razorpay checkout here
-      // For now simulate success
-      await fetch(`${BASE}/payments/verify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ plan, orderId: order.orderId }),
+      if (!res.ok) throw new Error(order.error || 'Could not start payment');
+      await loadRazorpay();
+      const rzp = new window.Razorpay({
+        key: order.keyId,
+        amount: order.amount,
+        currency: order.currency,
+        order_id: order.orderId,
+        name: 'ResumeIQ',
+        description: `${plan} plan, 30 days`,
+        prefill: { email: user?.email },
+        handler: async (resp) => {
+          try {
+            // resp holds razorpay_order_id / razorpay_payment_id / razorpay_signature
+            const v = await fetch(`${BASE}/payments/verify`, { method: 'POST', headers: authHeaders(), body: JSON.stringify(resp) });
+            const data = await v.json();
+            if (!v.ok) throw new Error(data.error || 'Verification failed');
+            toast.success(`You're on the ${plan} plan now`);
+            setTimeout(() => window.location.reload(), 800);
+          } catch (err) { toast.error(err.message); }
+          finally { setLoading(''); }
+        },
+        modal: { ondismiss: () => setLoading('') },
       });
-      toast.success(`Upgraded to ${plan}! Refresh to see changes.`);
+      rzp.open();
     } catch (err) {
       toast.error(err.message);
-    } finally {
       setLoading('');
     }
   };
@@ -67,6 +115,20 @@ export default function Pricing() {
           Current plan: <strong style={{ color: '#5b51f8', textTransform: 'capitalize' }}>{user?.plan || 'free'}</strong>
         </p>
       </div>
+
+      {usage && (
+        <div style={{ background: '#fff', border: '1px solid #e5e3f5', borderRadius: 14, padding: '1rem 1.25rem', marginBottom: '1.75rem' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 18 }}>
+            <UsageBar label="Job postings" used={usage.jobs.used} limit={usage.jobs.limit} />
+            <UsageBar label="CVs analyzed this month" used={usage.cvs.used} limit={usage.cvs.limit} />
+          </div>
+          {usage.expires && (
+            <div style={{ fontSize: 12, color: '#6b6895', marginTop: 12 }}>
+              Your plan is active until <strong>{new Date(usage.expires).toLocaleDateString()}</strong>. After that it returns to Free.
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
         {plans.map(plan => (
@@ -94,16 +156,16 @@ export default function Pricing() {
             </div>
             <button
               onClick={() => upgrade(plan.key)}
-              disabled={loading === plan.key || user?.plan === plan.key}
-              style={{ width: '100%', padding: '10px', background: plan.accent ? '#5b51f8' : 'transparent', color: plan.accent ? '#fff' : '#5b51f8', border: `1px solid ${plan.accent ? '#5b51f8' : '#5b51f8'}`, borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: user?.plan === plan.key ? 'default' : 'pointer', fontFamily: 'inherit', opacity: user?.plan === plan.key ? 0.5 : 1 }}>
-              {user?.plan === plan.key ? 'Current plan' : loading === plan.key ? 'Processing…' : `Upgrade to ${plan.name}`}
+              disabled={loading === plan.key || plan.key === 'free'}
+              style={{ width: '100%', padding: '10px', background: plan.accent ? '#5b51f8' : 'transparent', color: plan.accent ? '#fff' : '#5b51f8', border: `1px solid ${plan.accent ? '#5b51f8' : '#5b51f8'}`, borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: plan.key === 'free' ? 'default' : 'pointer', fontFamily: 'inherit', opacity: plan.key === 'free' ? 0.5 : 1 }}>
+              {plan.key === 'free' ? (user?.plan === 'free' ? 'Current plan' : 'Free forever') : loading === plan.key ? 'Processing…' : user?.plan === plan.key ? 'Renew for 30 days' : `Upgrade to ${plan.name}`}
             </button>
           </div>
         ))}
       </div>
 
       <p style={{ textAlign: 'center', fontSize: 12, color: '#a09dc0', marginTop: '2rem' }}>
-        Payments powered by Razorpay · Cancel anytime
+        Payments powered by Razorpay · Each payment adds 30 days, no auto-renewal
       </p>
     </div>
   );

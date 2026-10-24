@@ -54,6 +54,21 @@ export async function getDb() {
       weight INTEGER DEFAULT 1,
       sort_order INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS usage (
+      user_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      cvs INTEGER DEFAULT 0,
+      PRIMARY KEY (user_id, month)
+    );
+    CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      plan TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      status TEXT DEFAULT 'created',
+      payment_id TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS applicants (
       id TEXT PRIMARY KEY,
       job_id TEXT NOT NULL,
@@ -71,6 +86,7 @@ export async function getDb() {
 
   // migrations for databases created before plan / is_public existed
   try { _db.run("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'"); } catch {}
+  try { _db.run("ALTER TABLE users ADD COLUMN plan_expires_at TEXT"); } catch {}
   try { _db.run("ALTER TABLE job_postings ADD COLUMN is_public INTEGER DEFAULT 0"); } catch {}
 
   save();
