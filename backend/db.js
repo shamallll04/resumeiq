@@ -7,7 +7,11 @@ const require = createRequire(import.meta.url);
 const initSqlJs = require('sql.js');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.join(__dirname, 'resumeiq.db');
+const DB_PATH = process.env.DB_PATH || (
+  process.env.NODE_ENV === 'production'
+    ? '/data/resumeiq.db'
+    : path.join(__dirname, 'resumeiq.db')
+);
 
 let _db = null;
 
