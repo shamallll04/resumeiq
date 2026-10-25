@@ -97,7 +97,7 @@ const app = express();
 app.set('trust proxy', 1);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-app.use(cors());
+const cors = require("cors")
 app.use(express.json());
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
