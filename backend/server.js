@@ -94,10 +94,23 @@ function applyRateLimit(req, res, next) {
 }
 
 const app = express();
-app.set('trust proxy', 1);
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-const cors = require("cors")
+app.set('trust proxy', 1);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
+
+app.use(cors({
+  origin: [
+    'https://resumeiq-khaki-chi.vercel.app',
+    'http://localhost:5173'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
